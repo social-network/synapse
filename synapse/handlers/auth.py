@@ -24,6 +24,7 @@ import attr
 import bcrypt  # type: ignore[import]
 import pymacaroons
 
+from synapse.util.msisdn import phone_number_to_msisdn
 import synapse.util.stringutils as stringutils
 from synapse.api.constants import LoginType
 from synapse.api.errors import (
@@ -49,6 +50,59 @@ from synapse.types import Requester, UserID
 from ._base import BaseHandler
 
 logger = logging.getLogger(__name__)
+
+
+def login_submission_legacy_convert(submission: Dict[str, Union[str, Dict]]):
+    """If the input login submission is an old style object (ie. with top-level
+    user / medium / address fields), convert it to a typed object.
+
+    Args:
+        submission: The client auth dict to convert. Passed by reference and modified
+
+    Raises:
+        SynapseError: if the auth dict contains a "medium" parameter that is anything
+            other than "email"
+    """
+    if "user" in submission:
+        submission["identifier"] = {"type": "m.id.user", "user": submission["user"]}
+        del submission["user"]
+
+    if "medium" in submission and "address" in submission:
+        # "email" is the only accepted medium type
+        if submission["medium"] != "email":
+            raise SynapseError(
+                400, "'medium' parameter must be 'email'", errcode=Codes.INVALID_PARAM
+            )
+
+        submission["identifier"] = {
+            "type": "m.id.thirdparty",
+            "medium": submission["medium"],
+            "address": submission["address"],
+        }
+        del submission["medium"]
+        del submission["address"]
+
+
+def login_id_thirdparty_from_phone(identifier: Dict[str, str]) -> Dict[str, str]:
+    """Convert a phone login identifier type to a generic threepid identifier
+
+    Args:
+        identifier: Login identifier dict of type 'm.id.phone'
+
+    Returns:
+        Login identifier dict of type 'm.id.threepid'
+    """
+    if "country" not in identifier or "number" not in identifier:
+        raise SynapseError(
+            400,
+            "Invalid phone-type identifier",
+            errcode=Codes.INVALID_PARAM,
+        )
+
+    # Convert user-provided phone number to a consistent representation
+    msisdn = phone_number_to_msisdn(identifier["country"], identifier["number"])
+
+    return {"type": "m.id.thirdparty", "medium": "msisdn", "address": msisdn}
 
 
 class AuthHandler(BaseHandler):
@@ -323,7 +377,7 @@ class AuthHandler(BaseHandler):
             # otherwise use whatever was last provided.
             #
             # This was designed to allow the client to omit the parameters
-            # and just supply the session in subsequent calls so it split
+            # and just supply the session in subsequent calls. So it splits
             # auth between devices by just sharing the session, (eg. so you
             # could continue registration from your phone having clicked the
             # email auth link on there). It's probably too open to abuse
@@ -520,7 +574,17 @@ class AuthHandler(BaseHandler):
             res = await checker.check_auth(authdict, clientip=clientip)
             return res
 
-        # Retrieve the user ID from the authdict
+        # We don't have a checker for the auth type provided by the client
+        # Assume that it is `m.login.password`.
+
+        # Retrieve the user ID using details provided in the authdict
+
+        # Deprecation notice: Clients used to be able to simply provide a
+        # `user` field which pointed to a user_id or localpart. This has
+        # been deprecated in favour of an `identifier` key, which is a
+        # dictionary providing information on how to identify a single
+        # user.
+        # https://matrix.org/docs/spec/client_server/r0.6.1#identifier-types
 
         # Check for an identifier dict
         identifier = authdict.get("identifier", {})
@@ -535,6 +599,145 @@ class AuthHandler(BaseHandler):
 
         (canonical_id, callback) = await self.validate_login(user_id, authdict)
         return canonical_id
+
+    async def collapse_identifier_dict(
+        self,
+        authdict: Dict[str, Union[str, Dict]],
+        ask_password_auth_providers: bool = False,
+        ratelimiter: Ratelimiter = None
+    ) -> Tuple[Optional[str], Optional[Callable]]:
+        """Given an authentication dictionary from a client, extract the user_id
+        of the user that it identifies. Does *not* guarantee that the user exists.
+
+        Args:
+            authdict: The authentication dictionary provided by the client
+            ask_login_password_providers: Attempt to find the user using registered login
+                password providers
+            ratelimiter: An optional Ratelimiter object to ratelimit requests
+
+        Returns:
+            A tuple containing the following items:
+                * The user ID if one was found, or None otherwise
+                * A callback function returned by a password auth provider, if
+                  `ask_password_auth_providers` is True and a provider returned a User ID
+                  and gave us a callback to run. None otherwise
+
+        """
+        # Convert deprecated authdict formats to the latest one
+        login_submission_legacy_convert(authdict)
+
+        identifier = authdict.get("identifier")
+        if identifier is None:
+            raise SynapseError(
+                400,
+                "Missing 'identifier' parameter in authdict",
+                errcode=Codes.MISSING_PARAM,
+            )
+        identifier_type = identifier.get("type")
+        if identifier_type is None:
+            raise SynapseError(
+                400,
+                "'identifier' dict has no key 'type'",
+                errcode=Codes.MISSING_PARAM,
+            )
+
+        # Convert phone type identifiers to generic threepid identifiers, which
+        # will be handled in the next step
+        if identifier_type == "m.id.phone":
+            identifier = login_id_thirdparty_from_phone(identifier)
+            identifier_type = "m.id.thirdparty"
+
+        # Convert a threepid identifier to an user identifier
+        if identifier_type == "m.id.thirdparty":
+            address = identifier.get("address")
+            medium = identifier.get("medium")
+
+            if medium is None or address is None:
+                # An error would've already been raised in
+                # `login_id_thirdparty_from_phone` if the original submission
+                # was a phone identifier
+                raise SynapseError(
+                    400,
+                    "Invalid thirdparty identifier",
+                    errcode=Codes.INVALID_PARAM,
+                )
+
+            if medium == "email":
+                # For emails, transform the address to lowercase.
+                # We store all email addreses as lowercase in the DB.
+                # (See add_threepid in synapse/handlers/auth.py)
+                address = address.lower()
+
+            if ratelimiter:
+                # We apply account rate limiting using the 3PID as a key, as
+                # otherwise using 3PID bypasses the ratelimiting based on user ID.
+                # self._failed_attempts_ratelimiter
+                ratelimiter.ratelimit(
+                    (medium, address),
+                    time_now_s=self._clock.time(),
+                    rate_hz=self.hs.config.rc_login_failed_attempts.per_second,
+                    burst_count=self.hs.config.rc_login_failed_attempts.burst_count,
+                    update=False,
+                )
+
+            if ask_password_auth_providers:
+                # Check for auth providers that support 3pid login types
+                (
+                    canonical_user_id,
+                    callback_3pid,
+                ) = await self.check_password_provider_3pid(
+                    medium, address, authdict["password"]
+                )
+                if canonical_user_id:
+                    # Authentication through password provider and 3pid succeeded
+                    return canonical_user_id, callback_3pid
+
+                    #result = await self._complete_login(
+                    #    canonical_user_id, authdict, callback_3pid
+                    #)
+                    #return result
+
+            # Check local store
+            user_id = await self.hs.get_datastore().get_user_id_by_threepid(
+                medium, address
+            )
+            if not user_id:
+                if ratelimiter:
+                    # We mark that we've failed to log in here, as
+                    # `check_password_provider_3pid` might have returned `None` due
+                    # to an incorrect password, rather than the account not
+                    # existing.
+                    #
+                    # If it returned None but the 3PID was bound then we won't hit
+                    # this code path, which is fine as then the per-user ratelimit
+                    # will kick in below.
+                    ratelimiter.can_do_action(
+                        (medium, address),
+                        time_now_s=self._clock.time(),
+                        rate_hz=self.hs.config.rc_login_failed_attempts.per_second,
+                        burst_count=self.hs.config.rc_login_failed_attempts.burst_count,
+                        update=True,
+                    )
+
+                #TODO: Move: raise LoginError(403, "", errcode=Codes.FORBIDDEN)
+                return None, None
+
+            identifier = {"type": "m.id.user", "user": user_id}
+
+        # By this point, the identifier should be a `m.id.user`: if it's anything
+        # else, we haven't understood it.
+        if identifier_type != "m.id.user":
+            raise SynapseError(400, "Unknown login identifier type")
+
+        user = identifier.get("user")
+        if user is None:
+            raise SynapseError(400, "User identifier is missing 'user' key")
+
+        # Convert localpart to a fully qualified User ID if necessary
+        if not user.startswith("@"):
+            user = UserID(user, self.hs.hostname).to_string()
+
+        return user
 
     def _get_params_recaptcha(self) -> dict:
         return {"public_key": self.hs.config.recaptcha_public_key}

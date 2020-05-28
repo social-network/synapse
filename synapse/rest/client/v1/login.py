@@ -27,51 +27,8 @@ from synapse.http.site import SynapseRequest
 from synapse.rest.client.v2_alpha._base import client_patterns
 from synapse.rest.well_known import WellKnownBuilder
 from synapse.types import UserID
-from synapse.util.msisdn import phone_number_to_msisdn
 
 logger = logging.getLogger(__name__)
-
-
-def login_submission_legacy_convert(submission):
-    """
-    If the input login submission is an old style object
-    (ie. with top-level user / medium / address) convert it
-    to a typed object.
-    """
-    if "user" in submission:
-        submission["identifier"] = {"type": "m.id.user", "user": submission["user"]}
-        del submission["user"]
-
-    if "medium" in submission and "address" in submission:
-        # "email" is the only accepted medium type
-        if submission["medium"] != "email":
-            raise SynapseError(
-                400, "'medium' parameter must be 'email'", errcode=Codes.INVALID_PARAM
-            )
-
-        submission["identifier"] = {
-            "type": "m.id.thirdparty",
-            "medium": submission["medium"],
-            "address": submission["address"],
-        }
-        del submission["medium"]
-        del submission["address"]
-
-
-def login_id_thirdparty_from_phone(identifier):
-    """
-    Convert a phone login identifier type to a generic threepid identifier
-    Args:
-        identifier(dict): Login identifier dict of type 'm.id.phone'
-
-    Returns: Login identifier dict of type 'm.id.threepid'
-    """
-    if "country" not in identifier or "number" not in identifier:
-        raise SynapseError(400, "Invalid phone-type identifier")
-
-    msisdn = phone_number_to_msisdn(identifier["country"], identifier["number"])
-
-    return {"type": "m.id.thirdparty", "medium": "msisdn", "address": msisdn}
 
 
 class LoginRestServlet(RestServlet):
@@ -180,97 +137,8 @@ class LoginRestServlet(RestServlet):
             login_submission.get("address"),
             login_submission.get("user"),
         )
-        login_submission_legacy_convert(login_submission)
 
-        if "identifier" not in login_submission:
-            raise SynapseError(400, "Missing param: identifier")
-
-        identifier = login_submission["identifier"]
-        if "type" not in identifier:
-            raise SynapseError(400, "Login identifier has no type")
-
-        # convert phone type identifiers to generic threepids
-        if identifier["type"] == "m.id.phone":
-            identifier = login_id_thirdparty_from_phone(identifier)
-
-        # convert threepid identifiers to user IDs
-        if identifier["type"] == "m.id.thirdparty":
-            address = identifier.get("address")
-            medium = identifier.get("medium")
-
-            if medium is None or address is None:
-                raise SynapseError(400, "Invalid thirdparty identifier")
-
-            if medium == "email":
-                # For emails, transform the address to lowercase.
-                # We store all email addreses as lowercase in the DB.
-                # (See add_threepid in synapse/handlers/auth.py)
-                address = address.lower()
-
-            # We also apply account rate limiting using the 3PID as a key, as
-            # otherwise using 3PID bypasses the ratelimiting based on user ID.
-            self._failed_attempts_ratelimiter.ratelimit(
-                (medium, address),
-                time_now_s=self._clock.time(),
-                rate_hz=self.hs.config.rc_login_failed_attempts.per_second,
-                burst_count=self.hs.config.rc_login_failed_attempts.burst_count,
-                update=False,
-            )
-
-            # Check for login providers that support 3pid login types
-            (
-                canonical_user_id,
-                callback_3pid,
-            ) = await self.auth_handler.check_password_provider_3pid(
-                medium, address, login_submission["password"]
-            )
-            if canonical_user_id:
-                # Authentication through password provider and 3pid succeeded
-
-                result = await self._complete_login(
-                    canonical_user_id, login_submission, callback_3pid
-                )
-                return result
-
-            # No password providers were able to handle this 3pid
-            # Check local store
-            user_id = await self.hs.get_datastore().get_user_id_by_threepid(
-                medium, address
-            )
-            if not user_id:
-                logger.warning(
-                    "unknown 3pid identifier medium %s, address %r", medium, address
-                )
-                # We mark that we've failed to log in here, as
-                # `check_password_provider_3pid` might have returned `None` due
-                # to an incorrect password, rather than the account not
-                # existing.
-                #
-                # If it returned None but the 3PID was bound then we won't hit
-                # this code path, which is fine as then the per-user ratelimit
-                # will kick in below.
-                self._failed_attempts_ratelimiter.can_do_action(
-                    (medium, address),
-                    time_now_s=self._clock.time(),
-                    rate_hz=self.hs.config.rc_login_failed_attempts.per_second,
-                    burst_count=self.hs.config.rc_login_failed_attempts.burst_count,
-                    update=True,
-                )
-                raise LoginError(403, "", errcode=Codes.FORBIDDEN)
-
-            identifier = {"type": "m.id.user", "user": user_id}
-
-        # by this point, the identifier should be an m.id.user: if it's anything
-        # else, we haven't understood it.
-        if identifier["type"] != "m.id.user":
-            raise SynapseError(400, "Unknown login identifier type")
-        if "user" not in identifier:
-            raise SynapseError(400, "User identifier is missing 'user' key")
-
-        if identifier["user"].startswith("@"):
-            qualified_user_id = identifier["user"]
-        else:
-            qualified_user_id = UserID(identifier["user"], self.hs.hostname).to_string()
+        qualified_user_id = self.auth_handler()
 
         # Check if we've hit the failed ratelimit (but don't update it)
         self._failed_attempts_ratelimiter.ratelimit(
@@ -305,20 +173,20 @@ class LoginRestServlet(RestServlet):
         return result
 
     async def _complete_login(
-        self, user_id, login_submission, callback=None, create_non_existant_users=False
+        self, user_id, login_submission, callback=None, create_non_existent_users=False
     ):
         """Called when we've successfully authed the user and now need to
-        actually login them in (e.g. create devices). This gets called on
-        all succesful logins.
+        actually log them in (e.g. create devices). This gets called on
+        all successful logins.
 
-        Applies the ratelimiting for succesful login attempts against an
+        Applies the ratelimiting for successful login attempts against an
         account.
 
         Args:
             user_id (str): ID of the user to register.
             login_submission (dict): Dictionary of login information.
             callback (func|None): Callback function to run after registration.
-            create_non_existant_users (bool): Whether to create the user if
+            create_non_existent_users (bool): Whether to create the user if
                 they don't exist. Defaults to False.
 
         Returns:
@@ -337,7 +205,7 @@ class LoginRestServlet(RestServlet):
             update=True,
         )
 
-        if create_non_existant_users:
+        if create_non_existent_users:
             user_id = await self.auth_handler.check_user_exists(user_id)
             if not user_id:
                 user_id = await self.registration_handler.register_user(
@@ -397,7 +265,7 @@ class LoginRestServlet(RestServlet):
 
         user_id = UserID(user, self.hs.hostname).to_string()
         result = await self._complete_login(
-            user_id, login_submission, create_non_existant_users=True
+            user_id, login_submission, create_non_existent_users=True
         )
         return result
 
