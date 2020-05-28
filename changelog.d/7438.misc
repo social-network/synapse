@@ -1,0 +1,1 @@
+Synapse no longer requires the deprecated `user` parameter on User Interactive Authentication-enabled endpoints.
