@@ -337,7 +337,7 @@ class RegistrationConfig(Config):
         account_threepid_delegates:
             #email: https://example.com     # Delegate email sending to example.com
             #msisdn: http://localhost:8090  # Delegate SMS sending to this local process
-            
+
             # Only delegate threepid registration, not password resets. Defaults to
             # false.
             #

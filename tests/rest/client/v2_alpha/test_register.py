@@ -18,6 +18,7 @@
 import datetime
 import json
 import os
+
 from mock import Mock
 
 import pkg_resources
@@ -321,7 +322,6 @@ class RegisterRestServletTestCase(unittest.HomeserverTestCase):
         email = "kermit@example.com"
 
         user_id = self.register_user("kermit", "monkey")
-        tok = self.login("kermit", "monkey")
 
         self.delegated_attempts = 0
         self.local_attempts = 0
