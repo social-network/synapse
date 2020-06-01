@@ -18,6 +18,7 @@
 import datetime
 import json
 import os
+from mock import Mock
 
 import pkg_resources
 
@@ -34,6 +35,7 @@ from tests import unittest
 class RegisterRestServletTestCase(unittest.HomeserverTestCase):
 
     servlets = [
+        account.register_servlets,
         login.register_servlets,
         register.register_servlets,
         synapse.rest.admin.register_servlets,
@@ -304,6 +306,74 @@ class RegisterRestServletTestCase(unittest.HomeserverTestCase):
         self.assertEquals(200, channel.code, channel.result)
 
         self.assertIsNotNone(channel.json_body.get("sid"))
+
+    @unittest.override_config(
+        {
+            "account_threepid_delegates": {
+                "email": "https://id_server",
+                "msisdn": "https://id_server",
+                "registration_only": True,
+            },
+            "public_baseurl": "https://test_server",
+        }
+    )
+    def test_threepid_delegate_registration_only(self):
+        email = "kermit@example.com"
+
+        user_id = self.register_user("kermit", "monkey")
+        tok = self.login("kermit", "monkey")
+
+        self.delegated_attempts = 0
+        self.local_attempts = 0
+
+        async def requestEmailToken(
+            id_server, email, client_secret, send_attempt, next_link=None,
+        ):
+            self.delegated_attempts += 1
+            return {"sid": 1234}
+
+        async def send_threepid_validation(
+            email_address, client_secret, send_attempt, send_email_func, next_link=None,
+        ):
+            self.local_attempts += 1
+            return 1234
+
+        identity_handler = self.hs.get_handlers().identity_handler
+        identity_handler.requestEmailToken = Mock(side_effect=requestEmailToken)
+        identity_handler.send_threepid_validation = Mock(
+            side_effect=send_threepid_validation,
+        )
+
+        body = {"client_secret": "somesecret", "email": email, "send_attempt": 0}
+        request, channel = self.make_request(
+            "POST", "/account/3pid/email/requestToken", body,
+        )
+        self.render(request)
+
+        self.assertEqual(channel.code, 200, channel.json_body)
+        self.assertEqual(self.delegated_attempts, 1)
+        self.assertEqual(self.local_attempts, 0)
+
+        # Add a threepid
+        self.get_success(
+            self.hs.get_datastore().user_add_threepid(
+                user_id=user_id,
+                medium="email",
+                address=email,
+                validated_at=0,
+                added_at=0,
+            )
+        )
+
+        body = {"client_secret": "somesecret", "email": email, "send_attempt": 0}
+        request, channel = self.make_request(
+            "POST", "/account/password/email/requestToken", body,
+        )
+        self.render(request)
+
+        self.assertEqual(channel.code, 200, channel.json_body)
+        self.assertEqual(self.delegated_attempts, 1)
+        self.assertEqual(self.local_attempts, 1)
 
 
 class AccountValidityTestCase(unittest.HomeserverTestCase):
