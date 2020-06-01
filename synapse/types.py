@@ -251,7 +251,7 @@ class GroupID(DomainSpecificString):
 
 
 mxid_localpart_allowed_characters = set(
-    "_-./=" + string.ascii_lowercase + string.digits
+    "_-./=" + string.ascii_lowercase + string.digits + string.ascii_uppercase
 )
 
 
