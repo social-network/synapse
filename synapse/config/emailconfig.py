@@ -152,6 +152,23 @@ class EmailConfig(Config):
             jinja2
             bleach
 
+        if (
+            self.threepid_behaviour_email == ThreepidBehaviour.LOCAL
+            or self.only_delegate_threepid_registration
+        ):
+            # If delegation is only configured for registration, we still have to handle
+            # password resets, so we still need password reset templates.
+            self.email_password_reset_template_html = email_config.get(
+                "password_reset_template_html", "password_reset.html"
+            )
+            self.email_password_reset_template_text = email_config.get(
+                "password_reset_template_text", "password_reset.txt"
+            )
+
+            self.email_password_reset_template_failure_html = email_config.get(
+                "password_reset_template_failure_html", "password_reset_failure.html"
+            )
+
         if self.threepid_behaviour_email == ThreepidBehaviour.LOCAL:
             missing = []
             if not self.email_notif_from:
@@ -169,12 +186,6 @@ class EmailConfig(Config):
 
             # These email templates have placeholders in them, and thus must be
             # parsed using a templating engine during a request
-            self.email_password_reset_template_html = email_config.get(
-                "password_reset_template_html", "password_reset.html"
-            )
-            self.email_password_reset_template_text = email_config.get(
-                "password_reset_template_text", "password_reset.txt"
-            )
             self.email_registration_template_html = email_config.get(
                 "registration_template_html", "registration.html"
             )
@@ -188,9 +199,6 @@ class EmailConfig(Config):
                 "add_threepid_template_text", "add_threepid.txt"
             )
 
-            self.email_password_reset_template_failure_html = email_config.get(
-                "password_reset_template_failure_html", "password_reset_failure.html"
-            )
             self.email_registration_template_failure_html = email_config.get(
                 "registration_template_failure_html", "registration_failure.html"
             )

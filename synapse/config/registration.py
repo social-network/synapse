@@ -117,6 +117,10 @@ class RegistrationConfig(Config):
                 "configure `public_baseurl`."
             )
 
+        self.only_delegate_threepid_registration = account_threepid_delegates.get(
+            "registration_only", False,
+        )
+
         self.default_identity_server = config.get("default_identity_server")
         self.allow_guest_access = config.get("allow_guest_access", False)
 
@@ -333,6 +337,11 @@ class RegistrationConfig(Config):
         account_threepid_delegates:
             #email: https://example.com     # Delegate email sending to example.com
             #msisdn: http://localhost:8090  # Delegate SMS sending to this local process
+            
+            # Only delegate threepid registration, not password resets. Defaults to
+            # false.
+            #
+            #registration_only: true
 
         # Whether users are allowed to change their displayname after it has
         # been initially set. Useful when provisioning users based on the

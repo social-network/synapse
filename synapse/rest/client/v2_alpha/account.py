@@ -48,7 +48,12 @@ class EmailPasswordRequestTokenRestServlet(RestServlet):
         self.config = hs.config
         self.identity_handler = hs.get_handlers().identity_handler
 
-        if self.config.threepid_behaviour_email == ThreepidBehaviour.LOCAL:
+        self.only_delegate_registration = hs.config.only_delegate_threepid_registration
+
+        if (
+            self.config.threepid_behaviour_email == ThreepidBehaviour.LOCAL
+            or self.only_delegate_registration
+        ):
             template_html, template_text = load_jinja2_templates(
                 self.config.email_template_dir,
                 [
@@ -107,7 +112,10 @@ class EmailPasswordRequestTokenRestServlet(RestServlet):
 
             raise SynapseError(400, "Email not found", Codes.THREEPID_NOT_FOUND)
 
-        if self.config.threepid_behaviour_email == ThreepidBehaviour.REMOTE:
+        if (
+            self.config.threepid_behaviour_email == ThreepidBehaviour.REMOTE
+            and not self.only_delegate_registration
+        ):
             assert self.hs.config.account_threepid_delegate_email
 
             # Have the configured identity server handle the request
@@ -152,7 +160,10 @@ class PasswordResetSubmitTokenServlet(RestServlet):
         self.config = hs.config
         self.clock = hs.get_clock()
         self.store = hs.get_datastore()
-        if self.config.threepid_behaviour_email == ThreepidBehaviour.LOCAL:
+        if (
+            self.config.threepid_behaviour_email == ThreepidBehaviour.LOCAL
+            or self.config.only_delegate_threepid_registration
+        ):
             (self.failure_email_template,) = load_jinja2_templates(
                 self.config.email_template_dir,
                 [self.config.email_password_reset_template_failure_html],
